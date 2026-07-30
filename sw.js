@@ -1,4 +1,4 @@
-const CACHE = "inventario-v6";
+const CACHE = "inventario-v7";
 const ARQUIVOS = ["./", "./index.html", "./app.js", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (event) => {
