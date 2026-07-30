@@ -927,6 +927,8 @@ function BarcodeModal({ target, items, pessoas, onAddPessoa, onClose, onConfirm 
   const [conferente, setConferente] = useState("");
   const [novaPessoa, setNovaPessoa] = useState(false);
   const [confirmado, setConfirmado] = useState(null); // { patrimonio, conferente }
+  const [zoomCap, setZoomCap] = useState(null); // { min, max, step }
+  const [zoomAtual, setZoomAtual] = useState(null);
   const scannerRef = useRef(null);
   const regionId = "leitor-codigo-barras";
 
@@ -995,7 +997,7 @@ function BarcodeModal({ target, items, pessoas, onAddPessoa, onClose, onConfirm 
       return;
     }
 
-    const config = { fps: 12, qrbox: { width: 300, height: 160 }, aspectRatio: 1.777778, disableFlip: false };
+    const config = { fps: 15, qrbox: { width: 300, height: 180 }, disableFlip: false };
 
     const tentarIniciar = async (cameraConfig) => {
       const html5Qr = new Html5Qrcode(regionId);
@@ -1010,43 +1012,75 @@ function BarcodeModal({ target, items, pessoas, onAddPessoa, onClose, onConfirm 
             await pararStreamInterno();
           } catch {}
           setScanning(false);
+          setZoomCap(null);
+          setZoomAtual(null);
           aplicarCodigo(decodedText);
         },
         () => {}
       );
+      try {
+        const caps = html5Qr.getRunningTrackCapabilities();
+        if (caps && caps.zoom && caps.zoom.max > caps.zoom.min) {
+          const step = caps.zoom.step || 0.1;
+          setZoomCap({ min: caps.zoom.min, max: caps.zoom.max, step });
+          const inicial = Math.min(caps.zoom.max, caps.zoom.min + (caps.zoom.max - caps.zoom.min) * 0.3);
+          setZoomAtual(inicial);
+          html5Qr.applyVideoConstraints({ advanced: [{ zoom: inicial }] }).catch(() => {});
+        } else {
+          setZoomCap(null);
+          setZoomAtual(null);
+        }
+      } catch {
+        setZoomCap(null);
+        setZoomAtual(null);
+      }
     };
 
     try {
-      await tentarIniciar({ facingMode: "environment" });
+      await tentarIniciar({ facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } });
     } catch (e1) {
       try {
-        const cameras = await Html5Qrcode.getCameras();
-        if (cameras && cameras.length) {
-          const traseira = cameras.find((c) => /back|traseira|rear|environment/i.test(c.label || "")) || cameras[cameras.length - 1];
-          await tentarIniciar(traseira.id);
-        } else {
-          throw e1;
-        }
-      } catch (e2) {
-        setScanning(false);
-        const nome = (e2 && e2.name) || (e1 && e1.name) || "";
-        if (nome === "NotAllowedError") {
-          setError("Permissão da câmera negada. Nas configurações do navegador (ou do site), permita o acesso à câmera e tente de novo.");
-        } else if (nome === "NotFoundError") {
-          setError("Nenhuma câmera foi encontrada neste aparelho.");
-        } else if (nome === "NotReadableError") {
-          setError("A câmera parece estar em uso por outro aplicativo. Feche outros apps que usem a câmera e tente de novo.");
-        } else {
-          setError("Não foi possível acessar a câmera. Se você abriu pelo ícone instalado na tela inicial, tente abrir o mesmo link direto pelo navegador (Safari/Chrome) e permitir o acesso à câmera. Você também pode usar a leitura manual.");
+        await tentarIniciar({ facingMode: "environment" });
+      } catch (e1b) {
+        try {
+          const cameras = await Html5Qrcode.getCameras();
+          if (cameras && cameras.length) {
+            const traseira = cameras.find((c) => /back|traseira|rear|environment/i.test(c.label || "")) || cameras[cameras.length - 1];
+            await tentarIniciar(traseira.id);
+          } else {
+            throw e1b;
+          }
+        } catch (e2) {
+          setScanning(false);
+          const nome = (e2 && e2.name) || (e1b && e1b.name) || (e1 && e1.name) || "";
+          if (nome === "NotAllowedError") {
+            setError("Permissão da câmera negada. Nas configurações do navegador (ou do site), permita o acesso à câmera e tente de novo.");
+          } else if (nome === "NotFoundError") {
+            setError("Nenhuma câmera foi encontrada neste aparelho.");
+          } else if (nome === "NotReadableError") {
+            setError("A câmera parece estar em uso por outro aplicativo. Feche outros apps que usem a câmera e tente de novo.");
+          } else {
+            setError("Não foi possível acessar a câmera. Se você abriu pelo ícone instalado na tela inicial, tente abrir o mesmo link direto pelo navegador (Safari/Chrome) e permitir o acesso à câmera. Você também pode usar a leitura manual.");
+          }
         }
       }
     }
   };
 
+  const ajustarZoom = (v) => {
+    setZoomAtual(v);
+    if (scannerRef.current) {
+      scannerRef.current.applyVideoConstraints({ advanced: [{ zoom: v }] }).catch(() => {});
+    }
+  };
+
+
 
   const pararScanner = async () => {
     await pararStreamInterno();
     setScanning(false);
+    setZoomCap(null);
+    setZoomAtual(null);
   };
 
   const lerProximo = () => {
@@ -1093,9 +1127,25 @@ function BarcodeModal({ target, items, pessoas, onAddPessoa, onClose, onConfirm 
         {!confirmado && !result && !manual && (
           <>
             <div id={regionId} style={{ width: "100%", height: scanning ? 260 : 0, overflow: "hidden", background: "#000", marginBottom: scanning ? 12 : 0 }}></div>
+            {scanning && zoomCap && (
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, color: "#8A94A0", marginBottom: 4 }}>
+                  <span>🔍 Aproximar (zoom)</span>
+                </div>
+                <input
+                  type="range"
+                  min={zoomCap.min}
+                  max={zoomCap.max}
+                  step={zoomCap.step}
+                  value={zoomAtual ?? zoomCap.min}
+                  onChange={(e) => ajustarZoom(Number(e.target.value))}
+                  style={{ width: "100%" }}
+                />
+              </div>
+            )}
             {scanning && (
               <div style={{ fontSize: 12, color: "#8A94A0", marginBottom: 10 }}>
-                Aproxime bem a câmera do código de barras até preencher o quadro, e segure firme por um instante — códigos pequenos podem levar alguns segundos para focar.
+                Aproxime bem a câmera do código de barras até preencher o quadro{zoomCap ? " (ou use o zoom acima)" : ""}, e segure firme por um instante — códigos pequenos podem levar alguns segundos para focar.
               </div>
             )}
             {!scanning ? (
