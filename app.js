@@ -25,6 +25,7 @@ const TIPOS = [
 ];
 
 const STATUS = [
+  { key: "Pendente", color: "#B26EF5" },
   { key: "Em uso", color: "#4C9AFF" },
   { key: "Disponível", color: "#3DD68C" },
   { key: "Manutenção", color: "#F5B700" },
@@ -35,6 +36,40 @@ const statusColor = (s) => STATUS.find((x) => x.key === s)?.color || "#8A94A0";
 const CADASTRO_SENHA = "1234"; // TODO: trocar por uma senha definitiva
 const TURNO_TABS = ["T1", "T2", "T3", "Escalas"];
 const ESCALAS = ["Escala A1", "Escala A2", "Escala B1", "Escala B2"];
+
+// ==== SINCRONIZAÇÃO COM GOOGLE SHEETS ====
+// Cole aqui o link do Apps Script (termina em /exec) depois de publicar, e o mesmo token definido no Code.gs
+const PLANILHA_URL = "COLE_AQUI_O_LINK_DO_APPS_SCRIPT";
+const PLANILHA_TOKEN = "TROQUE-ESTE-TOKEN-123";
+
+function planilhaConfigurada() {
+  return PLANILHA_URL && !PLANILHA_URL.includes("COLE_AQUI");
+}
+
+async function buscarDadosRemotos() {
+  if (!planilhaConfigurada()) return null;
+  try {
+    const res = await fetch(PLANILHA_URL, { method: "GET" });
+    const data = await res.json();
+    if (data && data.ok) return { equipamentos: data.equipamentos || [], pessoas: data.pessoas || [] };
+  } catch {}
+  return null;
+}
+
+async function enviarDadosRemotos(payload) {
+  if (!planilhaConfigurada()) return false;
+  try {
+    const res = await fetch(PLANILHA_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ token: PLANILHA_TOKEN, ...payload }),
+    });
+    const data = await res.json();
+    return !!(data && data.ok);
+  } catch {
+    return false;
+  }
+}
 
 function uid() {
   return Math.random().toString(36).slice(2, 8).toUpperCase();
@@ -100,6 +135,8 @@ function InventarioEquipamentos() {
   const [items, setItems] = useState(() => loadJSON("equipamentos", []));
   const [pessoas, setPessoas] = useState(() => loadJSON("pessoas_inventario", []));
   const [saveErr, setSaveErr] = useState(false);
+  const [carregando, setCarregando] = useState(planilhaConfigurada());
+  const [offline, setOffline] = useState(!planilhaConfigurada());
   const [filterTipo, setFilterTipo] = useState("Todos");
   const [filterStatus, setFilterStatus] = useState("Todos");
   const [search, setSearch] = useState("");
@@ -113,14 +150,36 @@ function InventarioEquipamentos() {
   const [dashboardOpen, setDashboardOpen] = useState(false);
   const fileInputRef = useRef(null);
 
+  useEffect(() => {
+    (async () => {
+      const remoto = await buscarDadosRemotos();
+      if (remoto) {
+        setItems(remoto.equipamentos);
+        setPessoas(remoto.pessoas);
+        saveJSON("equipamentos", remoto.equipamentos);
+        saveJSON("pessoas_inventario", remoto.pessoas);
+        setOffline(false);
+      } else if (planilhaConfigurada()) {
+        setOffline(true);
+      }
+      setCarregando(false);
+    })();
+  }, []);
+
   const persist = (next) => {
     setItems(next);
     setSaveErr(!saveJSON("equipamentos", next));
+    if (planilhaConfigurada()) {
+      enviarDadosRemotos({ equipamentos: next }).then((ok) => setOffline(!ok));
+    }
   };
 
   const persistPessoas = (next) => {
     setPessoas(next);
     saveJSON("pessoas_inventario", next);
+    if (planilhaConfigurada()) {
+      enviarDadosRemotos({ pessoas: next }).then((ok) => setOffline(!ok));
+    }
   };
 
   const addPessoa = (nome) => {
@@ -128,6 +187,22 @@ function InventarioEquipamentos() {
     if (!limpo) return;
     if (pessoas.some((p) => p.toLowerCase() === limpo.toLowerCase())) return;
     persistPessoas([...pessoas, limpo].sort((a, b) => a.localeCompare(b, "pt-BR")));
+  };
+
+  const importarPessoas = (nomes) => {
+    const atuais = new Set(pessoas.map((p) => p.toLowerCase()));
+    const novos = [];
+    nomes.forEach((n) => {
+      const limpo = (n || "").trim();
+      if (!limpo) return;
+      const chave = limpo.toLowerCase();
+      if (atuais.has(chave)) return;
+      atuais.add(chave);
+      novos.push(limpo);
+    });
+    if (!novos.length) return 0;
+    persistPessoas([...pessoas, ...novos].sort((a, b) => a.localeCompare(b, "pt-BR")));
+    return novos.length;
   };
 
   const addItem = (data) => {
@@ -227,6 +302,34 @@ function InventarioEquipamentos() {
     });
     persist(next);
     setMoveItem(null);
+  };
+
+  const preCadastrarPorCodigo = (codigo, tipo) => {
+    const now = new Date().toISOString();
+    const novo = {
+      id: uid(),
+      tipo,
+      patrimonio: codigo,
+      modelo: "",
+      setor: "",
+      responsaveis: emptyResponsaveis(),
+      status: "Pendente",
+      atualizado: now,
+      conferido: false,
+      conferidoEm: null,
+      conferidoPor: null,
+      historico: [
+        {
+          data: now,
+          evento: "Pré-cadastro (QR/código)",
+          responsaveis: "—",
+          setor: "—",
+          obs: "Criado automaticamente pela leitura do código. Área e responsável ainda pendentes — complete em Movimentar.",
+        },
+      ],
+    };
+    persist([novo, ...items]);
+    return novo;
   };
 
   const confirmConferencia = (item, codigo, conferente) => {
@@ -433,6 +536,9 @@ function InventarioEquipamentos() {
             {STATUS.map((s) => <option key={s.key}>{s.key}</option>)}
           </select>
           <button onClick={() => setPwGate({ action: "add" })} style={primaryBtn}>➕ Cadastrar equipamento</button>
+          <button onClick={() => setCheckModal({ item: null })} style={{ ...primaryBtn, background: "transparent", border: "1px solid #FF7A1A", color: "#FF7A1A" }}>
+            📷 Ler código / QR Code
+          </button>
           <button onClick={() => setPersonOpen(true)} style={{ ...primaryBtn, background: "#1B2128", color: "#E8EDF2", border: "1px solid #2E3742" }}>
             👤➕ Cadastrar pessoa
           </button>
@@ -457,6 +563,24 @@ function InventarioEquipamentos() {
         {saveErr && (
           <div style={{ background: "#2A1B1B", border: "1px solid #FF5C5C", color: "#FF9C9C", padding: "8px 12px", fontSize: 13, marginBottom: 14 }}>
             Não foi possível salvar no armazenamento deste navegador. Verifique o espaço disponível.
+          </div>
+        )}
+
+        {carregando && (
+          <div style={{ background: "#1B2128", border: "1px solid #2E3742", color: "#8A94A0", padding: "8px 12px", fontSize: 13, marginBottom: 14 }}>
+            🔄 Sincronizando com a planilha compartilhada…
+          </div>
+        )}
+
+        {!carregando && planilhaConfigurada() && offline && (
+          <div style={{ background: "#2A2410", border: "1px solid #F5B700", color: "#F5D97A", padding: "8px 12px", fontSize: 13, marginBottom: 14 }}>
+            ⚠️ Não foi possível sincronizar com a planilha compartilhada agora. Os dados estão sendo salvos só neste aparelho e serão enviados quando a conexão voltar.
+          </div>
+        )}
+
+        {!planilhaConfigurada() && (
+          <div style={{ background: "#1B2128", border: "1px dashed #2E3742", color: "#8A94A0", padding: "8px 12px", fontSize: 12.5, marginBottom: 14 }}>
+            ℹ️ Sincronização com planilha ainda não configurada — os dados estão salvos apenas neste aparelho.
           </div>
         )}
 
@@ -620,7 +744,7 @@ function InventarioEquipamentos() {
                     )}
                   </div>
                   <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
-                    <button onClick={() => setCheckModal({ item: it })} title="Conferir por código de barras" style={iconBtn}>📷</button>
+                    <button onClick={() => setCheckModal({ item: it })} title="Conferir por código de barras ou QR Code" style={iconBtn}>📷</button>
                     <button onClick={() => setHistItem(it)} title="Histórico" style={iconBtn}>🕐</button>
                     <button onClick={() => setMoveItem(it)} title="Movimentar" style={iconBtn}>🔁</button>
                     <button onClick={() => setPwGate({ action: "edit", item: it })} title="Editar cadastro" style={iconBtn}>✏️</button>
@@ -634,13 +758,13 @@ function InventarioEquipamentos() {
       </div>
 
       {pwGate && <PasswordModal onClose={() => setPwGate(null)} onSuccess={handlePwSuccess} />}
-      {addOpen && <AddModal onClose={() => setAddOpen(false)} onSave={addItem} />}
-      {editItem && <EditModal item={editItem} onClose={() => setEditItem(null)} onSave={editEquip} />}
-      {moveItem && <MoveModal item={moveItem} onClose={() => setMoveItem(null)} onSave={moveEquip} />}
+      {addOpen && <AddModal pessoas={pessoas} onClose={() => setAddOpen(false)} onSave={addItem} />}
+      {editItem && <EditModal item={editItem} pessoas={pessoas} onClose={() => setEditItem(null)} onSave={editEquip} />}
+      {moveItem && <MoveModal item={moveItem} pessoas={pessoas} onClose={() => setMoveItem(null)} onSave={moveEquip} />}
       {histItem && <HistModal item={histItem} onClose={() => setHistItem(null)} />}
-      {personOpen && <PersonModal pessoas={pessoas} onClose={() => setPersonOpen(false)} onSave={addPessoa} />}
+      {personOpen && <PersonModal pessoas={pessoas} onClose={() => setPersonOpen(false)} onSave={addPessoa} onImport={importarPessoas} />}
       {checkModal && (
-        <BarcodeModal target={checkModal.item} items={items} pessoas={pessoas} onAddPessoa={addPessoa} onClose={() => setCheckModal(null)} onConfirm={confirmConferencia} />
+        <BarcodeModal target={checkModal.item} items={items} pessoas={pessoas} onAddPessoa={addPessoa} onPreCadastro={preCadastrarPorCodigo} onClose={() => setCheckModal(null)} onConfirm={confirmConferencia} />
       )}
     </div>
   );
@@ -674,10 +798,11 @@ function ModalHeader({ title, onClose }) {
   );
 }
 
-function ResponsaveisPorTurno({ value, onChange }) {
+function ResponsaveisPorTurno({ value, onChange, pessoas }) {
   const [activeTab, setActiveTab] = useState("T1");
   const [inputNome, setInputNome] = useState("");
   const [escalaSel, setEscalaSel] = useState("Escala A1");
+  const datalistId = "lista-pessoas-turno";
 
   const preenchido = {
     T1: value.T1.length > 0,
@@ -737,7 +862,7 @@ function ResponsaveisPorTurno({ value, onChange }) {
             ))}
           </div>
           <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
-            <input style={{ ...field, marginBottom: 0, flex: 1 }} value={inputNome} onChange={(e) => setInputNome(e.target.value)}
+            <input style={{ ...field, marginBottom: 0, flex: 1 }} list={datalistId} value={inputNome} onChange={(e) => setInputNome(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && addEscala()} placeholder={`Nome (${escalaSel})`} />
             <button type="button" onClick={addEscala} style={{ ...primaryBtn, padding: "9px 14px" }}>+</button>
           </div>
@@ -753,7 +878,7 @@ function ResponsaveisPorTurno({ value, onChange }) {
       ) : (
         <>
           <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
-            <input style={{ ...field, marginBottom: 0, flex: 1 }} value={inputNome} onChange={(e) => setInputNome(e.target.value)}
+            <input style={{ ...field, marginBottom: 0, flex: 1 }} list={datalistId} value={inputNome} onChange={(e) => setInputNome(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && addNomeSimples()} placeholder={`Nome do turno ${activeTab}`} />
             <button type="button" onClick={addNomeSimples} style={{ ...primaryBtn, padding: "9px 14px" }}>+</button>
           </div>
@@ -767,6 +892,9 @@ function ResponsaveisPorTurno({ value, onChange }) {
           </div>
         </>
       )}
+      <datalist id={datalistId}>
+        {(pessoas || []).map((p) => <option key={p} value={p} />)}
+      </datalist>
       <div className="mono" style={{ fontSize: 11, color: "#5F6A75", marginTop: 4 }}>{resumoResponsaveis(value)}</div>
     </div>
   );
@@ -792,16 +920,43 @@ function PasswordModal({ onClose, onSuccess }) {
   );
 }
 
-function PersonModal({ pessoas, onClose, onSave }) {
+function PersonModal({ pessoas, onClose, onSave, onImport }) {
   const [nome, setNome] = useState("");
+  const [importText, setImportText] = useState("");
+  const [importMsg, setImportMsg] = useState("");
+  const fileRef = useRef(null);
   const salvar = () => { if (!nome.trim()) return; onSave(nome); setNome(""); };
+
+  const importarTexto = () => {
+    const nomes = importText.split(/[\n,;]+/).map((n) => n.trim()).filter(Boolean);
+    if (!nomes.length) return;
+    const qtd = onImport(nomes) || 0;
+    setImportText("");
+    setImportMsg(qtd > 0 ? `✅ ${qtd} pessoa(s) importada(s).` : "Nenhum nome novo — todos já estavam cadastrados.");
+  };
+
+  const importarArquivo = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const nomes = String(reader.result)
+        .split(/\r?\n/)
+        .map((linha) => linha.split(",")[0].trim())
+        .filter(Boolean);
+      const qtd = onImport(nomes) || 0;
+      setImportMsg(qtd > 0 ? `✅ ${qtd} pessoa(s) importada(s) do arquivo.` : "Nenhum nome novo encontrado no arquivo.");
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
 
   return (
     <div style={overlay} onClick={onClose}>
       <div style={{ ...modal, maxWidth: 380 }} onClick={(e) => e.stopPropagation()}>
         <ModalHeader title="Cadastrar pessoa" onClose={onClose} />
         <p style={{ fontSize: 13, color: "#8A94A0", marginTop: 0, marginBottom: 14 }}>
-          Pessoas cadastradas aparecem para seleção rápida ao registrar quem realizou uma conferência de inventário.
+          Pessoas cadastradas aparecem como sugestão ao preencher responsáveis e conferências — mas sempre dá pra digitar um nome novo também.
         </p>
         <label style={label}>Nome</label>
         <input style={field} autoFocus value={nome} onChange={(e) => setNome(e.target.value)}
@@ -810,6 +965,20 @@ function PersonModal({ pessoas, onClose, onSave }) {
           style={{ ...primaryBtn, width: "100%", justifyContent: "center", marginBottom: 18, opacity: nome.trim() ? 1 : 0.5, cursor: nome.trim() ? "pointer" : "not-allowed" }}>
           Adicionar
         </button>
+
+        <label style={label}>Importar lista de colaboradores</label>
+        <textarea style={{ ...field, minHeight: 70, resize: "vertical", fontSize: 13 }} value={importText} onChange={(e) => setImportText(e.target.value)}
+          placeholder={"Cole uma lista de nomes, um por linha (ou separados por vírgula)\nEx:\nJoão Silva\nMaria Souza"} />
+        <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+          <button disabled={!importText.trim()} onClick={importarTexto}
+            style={{ ...primaryBtn, flex: 1, justifyContent: "center", opacity: importText.trim() ? 1 : 0.5, cursor: importText.trim() ? "pointer" : "not-allowed" }}>
+            Importar lista colada
+          </button>
+          <button onClick={() => fileRef.current?.click()} style={{ ...iconBtn, padding: "9px 12px" }}>📂 Arquivo</button>
+          <input ref={fileRef} type="file" accept=".txt,.csv" onChange={importarArquivo} style={{ display: "none" }} />
+        </div>
+        {importMsg && <div style={{ fontSize: 12.5, color: "#3DD68C", marginBottom: 14 }}>{importMsg}</div>}
+
         <label style={label}>Já cadastradas ({pessoas.length})</label>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
           {pessoas.length === 0 ? (
@@ -825,7 +994,7 @@ function PersonModal({ pessoas, onClose, onSave }) {
   );
 }
 
-function AddModal({ onClose, onSave }) {
+function AddModal({ onClose, onSave, pessoas }) {
   const [tipo, setTipo] = useState("Tablet");
   const [patrimonio, setPatrimonio] = useState("");
   const [modelo, setModelo] = useState("");
@@ -846,7 +1015,7 @@ function AddModal({ onClose, onSave }) {
         <input style={field} value={modelo} onChange={(e) => setModelo(e.target.value)} placeholder="Ex: Samsung Tab Active 4" />
         <label style={label}>Setor</label>
         <input style={field} value={setor} onChange={(e) => setSetor(e.target.value)} placeholder="Ex: Expedição" />
-        <ResponsaveisPorTurno value={responsaveis} onChange={setResponsaveis} />
+        <ResponsaveisPorTurno value={responsaveis} onChange={setResponsaveis} pessoas={pessoas} />
         <button disabled={!patrimonio.trim()}
           onClick={() => onSave({ tipo, patrimonio: patrimonio.trim(), modelo: modelo.trim(), setor: setor.trim(), responsaveis })}
           style={{ ...primaryBtn, width: "100%", justifyContent: "center", opacity: patrimonio.trim() ? 1 : 0.5, cursor: patrimonio.trim() ? "pointer" : "not-allowed" }}>
@@ -857,7 +1026,7 @@ function AddModal({ onClose, onSave }) {
   );
 }
 
-function EditModal({ item, onClose, onSave }) {
+function EditModal({ item, onClose, onSave, pessoas }) {
   const [tipo, setTipo] = useState(item.tipo);
   const [patrimonio, setPatrimonio] = useState(item.patrimonio);
   const [modelo, setModelo] = useState(item.modelo || "");
@@ -878,7 +1047,7 @@ function EditModal({ item, onClose, onSave }) {
         <input style={field} value={modelo} onChange={(e) => setModelo(e.target.value)} />
         <label style={label}>Setor</label>
         <input style={field} value={setor} onChange={(e) => setSetor(e.target.value)} />
-        <ResponsaveisPorTurno value={responsaveis} onChange={setResponsaveis} />
+        <ResponsaveisPorTurno value={responsaveis} onChange={setResponsaveis} pessoas={pessoas} />
         <button disabled={!patrimonio.trim()}
           onClick={() => onSave({ tipo, patrimonio: patrimonio.trim(), modelo: modelo.trim(), setor: setor.trim(), responsaveis })}
           style={{ ...primaryBtn, width: "100%", justifyContent: "center", opacity: patrimonio.trim() ? 1 : 0.5, cursor: patrimonio.trim() ? "pointer" : "not-allowed" }}>
@@ -889,7 +1058,7 @@ function EditModal({ item, onClose, onSave }) {
   );
 }
 
-function MoveModal({ item, onClose, onSave }) {
+function MoveModal({ item, onClose, onSave, pessoas }) {
   const [setor, setSetor] = useState(item.setor || "");
   const [status, setStatus] = useState(item.status);
   const [responsaveis, setResponsaveis] = useState(item.responsaveis || emptyResponsaveis());
@@ -902,7 +1071,7 @@ function MoveModal({ item, onClose, onSave }) {
         <div className="mono" style={{ fontSize: 13, color: "#8A94A0", marginBottom: 14 }}>{item.patrimonio} · {item.tipo}</div>
         <label style={label}>Setor</label>
         <input style={field} value={setor} onChange={(e) => setSetor(e.target.value)} placeholder="Ex: Recebimento" />
-        <ResponsaveisPorTurno value={responsaveis} onChange={setResponsaveis} />
+        <ResponsaveisPorTurno value={responsaveis} onChange={setResponsaveis} pessoas={pessoas} />
         <label style={label}>Status</label>
         <select style={field} value={status} onChange={(e) => setStatus(e.target.value)}>
           {STATUS.map((s) => <option key={s.key}>{s.key}</option>)}
@@ -917,7 +1086,7 @@ function MoveModal({ item, onClose, onSave }) {
   );
 }
 
-function BarcodeModal({ target, items, pessoas, onAddPessoa, onClose, onConfirm }) {
+function BarcodeModal({ target, items, pessoas, onAddPessoa, onPreCadastro, onClose, onConfirm }) {
   const [scanning, setScanning] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
@@ -926,7 +1095,8 @@ function BarcodeModal({ target, items, pessoas, onAddPessoa, onClose, onConfirm 
   const [selectedId, setSelectedId] = useState(target ? target.id : "");
   const [conferente, setConferente] = useState("");
   const [novaPessoa, setNovaPessoa] = useState(false);
-  const [confirmado, setConfirmado] = useState(null); // { patrimonio, conferente }
+  const [confirmado, setConfirmado] = useState(null); // { patrimonio, conferente, preCadastro }
+  const [tipoNovo, setTipoNovo] = useState("Tablet");
   const [zoomCap, setZoomCap] = useState(null); // { min, max, step }
   const [zoomAtual, setZoomAtual] = useState(null);
   const scannerRef = useRef(null);
@@ -1108,17 +1278,30 @@ function BarcodeModal({ target, items, pessoas, onAddPessoa, onClose, onConfirm 
     }
   };
 
+  const preCadastrar = () => {
+    if (!result?.codigo) return;
+    const novo = onPreCadastro(result.codigo, tipoNovo);
+    setConfirmado({ patrimonio: novo.patrimonio, preCadastro: true });
+    setResult(null);
+  };
+
   return (
     <div style={overlay} onClick={onClose}>
       <div style={modal} onClick={(e) => e.stopPropagation()}>
-        <ModalHeader title="Conferir por código de barras" onClose={onClose} />
+        <ModalHeader title="Conferir por código de barras / QR Code" onClose={onClose} />
         {target && <div className="mono" style={{ fontSize: 13, color: "#8A94A0", marginBottom: 14 }}>{target.patrimonio} · {target.tipo}</div>}
 
         {confirmado && (
           <div style={{ marginBottom: 4 }}>
-            <div style={{ background: "#12241A", border: "1px solid #3DD68C", color: "#3DD68C", padding: "10px 12px", fontSize: 13, marginBottom: 14 }}>
-              ✅ <span className="mono">{confirmado.patrimonio}</span> conferido por {confirmado.conferente}.
-            </div>
+            {confirmado.preCadastro ? (
+              <div style={{ background: "#241A2E", border: "1px solid #B26EF5", color: "#D8AFFA", padding: "10px 12px", fontSize: 13, marginBottom: 14 }}>
+                🆕 <span className="mono">{confirmado.patrimonio}</span> pré-cadastrado como <strong>Pendente</strong>. Área e responsável ficam pendentes — complete depois em "Movimentar".
+              </div>
+            ) : (
+              <div style={{ background: "#12241A", border: "1px solid #3DD68C", color: "#3DD68C", padding: "10px 12px", fontSize: 13, marginBottom: 14 }}>
+                ✅ <span className="mono">{confirmado.patrimonio}</span> conferido por {confirmado.conferente}.
+              </div>
+            )}
             <button onClick={lerProximo} style={{ ...primaryBtn, width: "100%", justifyContent: "center", marginBottom: 8 }}>📷 Ler próximo equipamento</button>
             <button onClick={onClose} style={{ ...iconBtn, width: "100%", justifyContent: "center", fontSize: 12.5 }}>Encerrar conferência</button>
           </div>
@@ -1180,7 +1363,30 @@ function BarcodeModal({ target, items, pessoas, onAddPessoa, onClose, onConfirm 
             <div style={{ fontSize: 12, color: "#8A94A0", marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.5 }}>Código lido</div>
             <div className="mono" style={{ fontSize: 16, marginBottom: 12 }}>{result.codigo}</div>
 
-            <label style={label}>Confirmar equipamento</label>
+            {!target && !selectedItem && (
+              <div style={{ background: "#1F1B2E", border: "1px solid #B26EF5", padding: 12, marginBottom: 14 }}>
+                <div style={{ fontSize: 13, color: "#D8AFFA", marginBottom: 10 }}>
+                  Esse código não está em nenhum equipamento cadastrado. Você pode pré-cadastrar automaticamente — só escolha o tipo, e o resto (área, responsável) fica pendente pra completar depois.
+                </div>
+                <label style={label}>Tipo do equipamento</label>
+                <div style={{ display: "flex", gap: 4, marginBottom: 10 }}>
+                  {TIPOS.map((t) => (
+                    <button key={t.key} type="button" onClick={() => setTipoNovo(t.key)}
+                      style={{ flex: 1, padding: "8px 4px", fontSize: 12.5, fontWeight: 600,
+                        background: tipoNovo === t.key ? "#B26EF5" : "#12161A",
+                        color: tipoNovo === t.key ? "#1F1B2E" : "#8A94A0",
+                        border: "1px solid #2E3742", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                      <TipoIcone tipoKey={t.key} size={14} color={tipoNovo === t.key ? "#1F1B2E" : "#8A94A0"} /> {t.key}
+                    </button>
+                  ))}
+                </div>
+                <button onClick={preCadastrar} style={{ ...primaryBtn, width: "100%", justifyContent: "center", background: "#B26EF5", color: "#1F1B2E" }}>
+                  🆕 Pré-cadastrar como novo equipamento
+                </button>
+              </div>
+            )}
+
+            <label style={label}>{!target && !selectedItem ? "Ou selecione um item já cadastrado" : "Confirmar equipamento"}</label>
             <select style={field} value={selectedId} onChange={(e) => setSelectedId(e.target.value)}>
               <option value="">Selecione o item do inventário</option>
               {items.map((it) => <option key={it.id} value={it.id}>{it.patrimonio} · {it.tipo}</option>)}
